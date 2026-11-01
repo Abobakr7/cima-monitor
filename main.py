@@ -1,8 +1,6 @@
-
 import json
 import os
 import re
-import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -20,6 +18,8 @@ CINEMA = "city-centre-almaza"
 CINEMA_NAME = "City Centre Almaza"
 
 STATE_FILE = Path("state.json")
+
+HEADING = re.compile(r"^h[1-6]$")
 
 MOVIES = [
     {
@@ -56,22 +56,23 @@ MOVIES = [
 
 
 def create_session():
+    """One retry layer only (the adapter), so waits stay bounded."""
     session = requests.Session()
 
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; VoxMonitor/1.0)",
+        "User-Agent": "curl/8.5.0",
+        "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9",
     })
 
     retry = Retry(
-        total=3,
-        backoff_factor=1,
+        total=4,
+        backoff_factor=3,  # sleeps ~0s, 6s, 12s, 24s between tries
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
 
     adapter = HTTPAdapter(max_retries=retry)
-
     session.mount("https://", adapter)
 
     return session
@@ -99,31 +100,12 @@ def save_state(state):
 
 
 def get_page(session, url):
-    max_attempts = 3
+    print(f"Fetching {url}")
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            print(f"Fetching {url} (attempt {attempt}/{max_attempts})")
+    response = session.get(url, timeout=(10, 60))
+    response.raise_for_status()
 
-            response = session.get(
-                url,
-                timeout=(10, 60)
-            )
-
-            response.raise_for_status()
-
-            return BeautifulSoup(response.text, "html.parser")
-
-        except requests.exceptions.RequestException as e:
-            print(f"Request failed: {e}")
-
-            if attempt == max_attempts:
-                raise
-
-            delay = 2 ** attempt * 5
-
-            print(f"Retrying in {delay} seconds...")
-            time.sleep(delay)
+    return BeautifulSoup(response.text, "html.parser")
 
 
 def get_available_dates(soup):
@@ -148,12 +130,7 @@ def get_available_dates(soup):
             continue
 
         try:
-            show_date = datetime.strptime(
-                raw_date, "%Y%m%d"
-            ).date()
-
-            dates.add(show_date)
-
+            dates.add(datetime.strptime(raw_date, "%Y%m%d").date())
         except ValueError:
             continue
 
@@ -162,112 +139,119 @@ def get_available_dates(soup):
 
 def find_movie_booking(soup, aliases):
     """
-    Find a real booking link inside the matching movie's
-    City Centre Almaza showtime section.
+    Find a real booking link inside the matching movie's own card.
 
-    A displayed movie title or plain text showtime is
-    not sufficient.
+    Starting from the movie's heading, climb to the smallest
+    container that holds a /booking/ link. If that container also
+    holds another movie's heading, we have climbed too far (into a
+    multi-movie container), so give up on this heading rather than
+    return another movie's link.
     """
 
-    wanted = {
-        normalize_title(alias)
-        for alias in aliases
-    }
+    wanted = {normalize_title(alias) for alias in aliases}
 
-    for heading in soup.find_all(re.compile(r"^h[1-6]$")):
+    # Each movie card has a "City Centre Almaza" sub-heading. It is
+    # not another movie, so it must not trigger the "too far up" check.
+    ignored = wanted | {normalize_title(CINEMA_NAME)}
 
-        title = normalize_title(
-            heading.get_text(" ", strip=True)
-        )
+    for heading in soup.find_all(HEADING):
 
-        if title not in wanted:
+        if normalize_title(heading.get_text(" ", strip=True)) not in wanted:
             continue
 
-        # Search the movie card's ancestors.
         for container in heading.parents:
 
-            if container.name in ("body", "html"):
+            if container.name in ("body", "html", "[document]"):
                 break
 
-            text = container.get_text(" ", strip=True)
-
-            if CINEMA_NAME.lower() not in text.lower():
-                continue
-
-            booking_links = []
+            links = []
 
             for anchor in container.select("a[href]"):
                 url = urljoin(BASE_URL, anchor["href"])
 
                 if "/booking/" in urlparse(url).path:
-                    booking_links.append((anchor, url))
+                    links.append((anchor, url))
 
-            if booking_links:
-                anchor, booking_url = booking_links[0]
+            if not links:
+                continue  # card not reached yet, keep climbing
 
-                return {
-                    "time": anchor.get_text(
-                        " ", strip=True
-                    ) or "Showtime available",
-                    "booking_url": booking_url,
-                }
+            other_titles = [
+                h for h in container.find_all(HEADING)
+                if normalize_title(h.get_text(" ", strip=True)) not in ignored
+            ]
+
+            if other_titles:
+                break  # too far up: container holds other movies
+
+            anchor, booking_url = links[0]
+
+            return {
+                "time": anchor.get_text(" ", strip=True)
+                or "Showtime available",
+                "booking_url": booking_url,
+            }
 
     return None
 
 
-def check_vox():
+def check_vox(movies):
+    """Check only the given movies. Returns {movie_key: result}."""
     session = create_session()
 
     try:
         print("Fetching VOX showtime page...")
 
-        landing_page = get_page(
-            session,
-            SHOWTIMES_URL
-        )
-
+        landing_page = get_page(session, SHOWTIMES_URL)
         dates = get_available_dates(landing_page)
 
-        print(f"VOX published {len(dates)} future dates.")
+        # Fail loudly if the markup changed, instead of silently
+        # reporting "nothing found" forever.
+        if not dates:
+            raise RuntimeError(
+                "No dates found in the VOX date selector. "
+                "The page structure may have changed or the request "
+                "was blocked."
+            )
+
+        print(f"VOX published {len(dates)} dates.")
 
         results = {}
+        pending = {movie["key"]: movie for movie in movies}
 
-        pending = {
-            movie["key"]: movie
-            for movie in MOVIES
-        }
+        fetched = 0
+        failed = 0
 
         for show_date in dates:
 
-            relevant_movies = [
+            relevant = [
                 movie
                 for movie in pending.values()
                 if show_date >= movie["target"]
             ]
 
-            if not relevant_movies:
+            if not relevant:
                 continue
-
-            date_string = show_date.strftime("%Y%m%d")
 
             url = (
                 f"{BASE_URL}/showtimes"
-                f"?c={CINEMA}&d={date_string}"
+                f"?c={CINEMA}&d={show_date.strftime('%Y%m%d')}"
             )
 
             print(f"Checking {show_date}...")
 
-            soup = get_page(session, url)
+            try:
+                soup = get_page(session, url)
+            except requests.exceptions.RequestException as e:
+                failed += 1
+                print(f"Skipping {show_date}: {e}")
+                continue
 
-            for movie in relevant_movies:
+            fetched += 1
 
-                booking = find_movie_booking(
-                    soup,
-                    movie["aliases"]
-                )
+            for movie in relevant:
+                booking = find_movie_booking(soup, movie["aliases"])
 
                 if booking:
-
                     results[movie["key"]] = {
                         "movie": movie["name"],
                         "target_date": movie["target"].isoformat(),
@@ -275,8 +259,14 @@ def check_vox():
                         **booking,
                     }
 
-                    # We only need one bookable session.
+                    # Only one bookable session is needed.
                     pending.pop(movie["key"])
+
+            if not pending:
+                break
+
+        if failed and not fetched:
+            raise RuntimeError("Every date page request failed.")
 
         return results
 
@@ -285,8 +275,10 @@ def check_vox():
 
 
 def send_telegram(message):
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    # token = os.environ["TELEGRAM_BOT_TOKEN"]
+    # chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    token = "9120847968:AAGfPjQj5zZdW3_hqGMUOHqcF3_l7TswQ_A"
+    chat_id = "1082410156"
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
@@ -321,11 +313,13 @@ def main():
         print("All movies have already triggered alerts.")
         return
 
-    available = check_vox()
+    available = check_vox(pending_movies)
 
     if not available:
         print("No new bookable sessions found.")
         return
+
+    errors = []
 
     for key, item in available.items():
 
@@ -339,21 +333,29 @@ def main():
             f"Book now:\n{item['booking_url']}"
         )
 
-        # Only save the alert after Telegram confirms success.
-        send_telegram(message)
+        try:
+            send_telegram(message)
+        except Exception as e:
+            # Don't mark as notified; it will retry next run.
+            # Keep going so one failure doesn't block other movies.
+            print(f"Failed to notify for {item['movie']}: {e}")
+            errors.append(item["movie"])
+            continue
 
+        # Only save the alert after Telegram confirms success.
         state[key] = {
             "notified": True,
             "available_date": item["available_date"],
             "booking_url": item["booking_url"],
-            "notified_at": datetime.now(
-                timezone.utc
-            ).isoformat(),
+            "notified_at": datetime.now(timezone.utc).isoformat(),
         }
 
         save_state(state)
 
         print(f"Notification sent: {item['movie']}")
+
+    if errors:
+        raise RuntimeError(f"Notifications failed for: {', '.join(errors)}")
 
 
 if __name__ == "__main__":
