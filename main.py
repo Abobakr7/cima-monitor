@@ -275,10 +275,8 @@ def check_vox(movies):
 
 
 def send_telegram(message):
-    # token = os.environ["TELEGRAM_BOT_TOKEN"]
-    # chat_id = os.environ["TELEGRAM_CHAT_ID"]
-    token = "9120847968:AAGfPjQj5zZdW3_hqGMUOHqcF3_l7TswQ_A"
-    chat_id = "1082410156"
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
