@@ -1,9 +1,8 @@
 name: VOX Showtime Monitor
 
 on:
-  push:
-    branches:
-      - main
+  schedule:
+    - cron: "*/10 * * * *"
 
   workflow_dispatch:
 

@@ -99,10 +99,31 @@ def save_state(state):
 
 
 def get_page(session, url):
-    response = session.get(url, timeout=30)
-    response.raise_for_status()
+    max_attempts = 3
 
-    return BeautifulSoup(response.text, "html.parser")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"Fetching {url} (attempt {attempt}/{max_attempts})")
+
+            response = session.get(
+                url,
+                timeout=(10, 60)
+            )
+
+            response.raise_for_status()
+
+            return BeautifulSoup(response.text, "html.parser")
+
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+
+            if attempt == max_attempts:
+                raise
+
+            delay = 2 ** attempt * 5
+
+            print(f"Retrying in {delay} seconds...")
+            time.sleep(delay)
 
 
 def get_available_dates(soup):
