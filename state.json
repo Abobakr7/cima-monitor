@@ -1,1 +1,20 @@
-{}
+{
+    "whalefall": {
+        "notified": true,
+        "available_date": "2026-11-06",
+        "booking_url": "https://egy.voxcinemas.com/booking/0047-277150",
+        "notified_at": "2026-11-05T16:41:02.666170+00:00"
+    },
+    "clayface": {
+        "notified": true,
+        "available_date": "2026-11-06",
+        "booking_url": "https://egy.voxcinemas.com/booking/0047-277207",
+        "notified_at": "2026-11-05T16:41:03.106966+00:00"
+    },
+    "resident-evil": {
+        "notified": true,
+        "available_date": "2026-11-06",
+        "booking_url": "https://egy.voxcinemas.com/booking/0047-277340",
+        "notified_at": "2026-11-05T16:41:03.550998+00:00"
+    }
+}
